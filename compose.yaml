@@ -1,0 +1,11 @@
+services:
+  recruit-collector:
+    build: .
+    image: recruit-collector:local
+    container_name: recruit-collector
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
