@@ -1555,11 +1555,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Send official frontend job report to Telegram.")
     parser.add_argument("--dry-run", action="store_true", help="Print the report without sending Telegram.")
     parser.add_argument("--max-companies", type=int, default=None, help="Limit company count for a quick smoke test.")
+    parser.add_argument("--once", action="store_true", help="Run once. This is useful when overriding the Docker schedule command.")
     parser.add_argument("--schedule", action="store_true", help="Keep running and send the report once a day.")
     parser.add_argument("--run-on-start", action="store_true", help="Send once immediately before waiting for the schedule.")
     parser.add_argument("--schedule-hour", type=int, default=DEFAULT_SCHEDULE_HOUR, help="KST hour for scheduled reports.")
     parser.add_argument("--schedule-minute", type=int, default=DEFAULT_SCHEDULE_MINUTE, help="KST minute for scheduled reports.")
     args = parser.parse_args()
+
+    if args.once and args.schedule:
+        parser.error("--once와 --schedule은 함께 사용할 수 없습니다.")
 
     if args.schedule:
         return run_schedule(

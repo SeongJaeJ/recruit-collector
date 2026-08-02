@@ -38,7 +38,7 @@ docker compose run --rm recruit-collector --dry-run --max-companies 5
 실제 텔레그램 전송을 한 번 테스트합니다.
 
 ```powershell
-docker compose run --rm recruit-collector
+docker compose run --rm recruit-collector --once
 ```
 
 매일 KST 오전 10시에 자동 전송되도록 백그라운드 실행합니다.
