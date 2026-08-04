@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
+from threading import BoundedSemaphore
 
 try:
     from zoneinfo import ZoneInfo
@@ -32,6 +33,41 @@ FALLBACK_CHAT_ID = ""
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 DEFAULT_SCHEDULE_HOUR = 10
 DEFAULT_SCHEDULE_MINUTE = 0
+
+# A browser is considerably more expensive than a normal HTTP request.  Keep it
+# as a narrowly-scoped recovery path for providers known to require a real
+# browser session or modern TLS handling.
+BROWSER_FALLBACK_HOSTS = frozenset(
+    {
+        "team.daangn.com",
+        "www.ktng.com",
+        "www.woorifg.com",
+        "with.nonghyup.com",
+        "recruit.kdb.co.kr",
+        "kdb.incruit.com",
+        "recruit.celltrion.com",
+    }
+)
+BROWSER_HTTPS_EXCEPTION_HOSTS = frozenset({"recruit.celltrion.com"})
+_BROWSER_FALLBACK_SLOTS = BoundedSemaphore(value=2)
+
+# A company home page frequently exposes its live postings through a separate
+# "all jobs" route.  Discover that route instead of hard-coding its URL.
+JOB_BOARD_LINK_TEXT_HINTS = (
+    "\ucc44\uc6a9\uacf5\uace0",
+    "\ucc44\uc6a9 \uacf5\uace0",
+    "\ucc44\uc6a9\uc815\ubcf4",
+    "\ucc44\uc6a9 \uc815\ubcf4",
+    "\ubaa8\uc544\ubcf4\uae30",
+    "job search",
+    "job openings",
+    "open positions",
+    "all jobs",
+)
+JOB_BOARD_PATH_HINTS = ("/search", "/job-search", "/jobs", "/careers", "/career", "/recruit")
+MAX_JOB_BOARD_CRAWL_DEPTH = 4
+MAX_DISCOVERED_JOB_BOARD_PAGES = 12
+MAX_JOB_BOARD_LINKS_PER_PAGE = 3
 
 DIRECT_FRONTEND_KEYWORDS = [
     "frontend",
@@ -527,7 +563,10 @@ COMPANIES = [
     },
     {
         "name": "NH NongHyup Bank",
-        "urls": ["https://with.nonghyup.com/main.do", "https://jrs.jobkorea.co.kr/nhbank"],
+        "urls": [
+            "https://with.nonghyup.com/jbnf/jbnfLst.do?srcAuthDsc=1",
+            "https://jrs.jobkorea.co.kr/nhbank",
+        ],
     },
     {
         "name": "KDB Korea Development Bank",
@@ -938,6 +977,78 @@ def fetch_url(url: str, timeout: int = 18) -> tuple[str, str]:
     return body, content_type
 
 
+def browser_fallback_supported(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in BROWSER_FALLBACK_HOSTS)
+
+
+def fetch_url_with_browser(url: str, timeout: int = 25) -> tuple[str, str]:
+    """Render an official career page only when the regular fetch cannot help.
+
+    Playwright is imported lazily so local unit tests and static-only use remain
+    lightweight.  A certificate exception is limited to the one official host
+    currently serving an expired certificate; it is never applied globally.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - depends on the Docker image
+        raise RuntimeError("Playwright is not installed in this runtime") from exc
+
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    timeout_ms = timeout * 1000
+    with _BROWSER_FALLBACK_SLOTS:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                locale="ko-KR",
+                ignore_https_errors=host in BROWSER_HTTPS_EXCEPTION_HOSTS,
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+            )
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 7000))
+                except Exception:
+                    # Recruitment sites often keep analytics connections open.
+                    pass
+                page.wait_for_timeout(800)
+                return page.content(), "text/html; browser-rendered"
+            finally:
+                context.close()
+                browser.close()
+
+
+def fetch_source_url(url: str, timeout: int = 18) -> tuple[str, str]:
+    """Fetch a source page, escalating to a browser only for supported hosts."""
+    try:
+        return fetch_url(url, timeout=timeout)
+    except Exception as fetch_error:
+        if not browser_fallback_supported(url):
+            raise fetch_error
+        try:
+            return fetch_url_with_browser(url, timeout=max(timeout, 25))
+        except Exception as browser_error:
+            raise RuntimeError(f"HTTP fetch failed: {fetch_error}; browser fallback failed: {browser_error}") from browser_error
+
+
+def is_closed_job_page(raw_html: str) -> bool:
+    """Recognize an official detail page that explicitly says the posting is gone."""
+    page_text = strip_html(raw_html).lower()
+    markers = (
+        "\ud398\uc774\uc9c0\ub97c \ucc3e\uc744 \uc218 \uc5c6\uc5b4\uc694",
+        "\uc874\uc7ac\ud558\uc9c0 \uc54a\ub294 \uacf5\uace0",
+        "\uacf5\uace0\ub97c \ucc3e\uc744 \uc218 \uc5c6",
+        "job not found",
+        "404 not found",
+    )
+    return any(marker in page_text for marker in markers)
+
+
 def find_keyword(text: str) -> str | None:
     lower = text.lower()
     for keyword in FRONTEND_KEYWORDS:
@@ -972,7 +1083,7 @@ def snippet_for(text: str, keyword: str, radius: int = 80) -> str:
     return prefix + text[start:end].strip() + suffix
 
 
-def extract_deadline(text: str) -> str:
+def extract_legacy_deadline(text: str) -> str:
     compact = normalize_ws(text)
     if not compact:
         return ""
@@ -1014,6 +1125,77 @@ def extract_deadline(text: str) -> str:
             return normalize_ws(match.group(0))
 
     return ""
+
+
+_DATE_VALUE_PATTERN = re.compile(
+    r"(?P<year>20\d{2})\s*(?:[.\-/]|\ub144)\s*(?P<month>\d{1,2})\s*(?:[.\-/]|\uc6d4)\s*(?P<day>\d{1,2})(?:\uc77c)?"
+    r"(?:\s*(?P<hour>\d{1,2}):(?P<minute>\d{2}))?"
+)
+
+
+def parse_deadline_at(value: str) -> datetime | None:
+    """Return a KST deadline, treating a date-only deadline as end-of-day."""
+    matches = list(_DATE_VALUE_PATTERN.finditer(value))
+    if not matches:
+        return None
+    match = matches[-1]  # For a date range, the last date is the closing date.
+    try:
+        hour = int(match.group("hour")) if match.group("hour") is not None else 23
+        minute = int(match.group("minute")) if match.group("minute") is not None else 59
+        second = 0 if match.group("hour") is not None else 59
+        return datetime(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+            hour,
+            minute,
+            second,
+            tzinfo=kst_timezone(),
+        )
+    except ValueError:
+        return None
+
+
+def format_deadline_at(deadline_at: datetime) -> str:
+    if deadline_at.hour == 23 and deadline_at.minute == 59 and deadline_at.second == 59:
+        return deadline_at.strftime("%Y-%m-%d")
+    return deadline_at.strftime("%Y-%m-%d %H:%M KST")
+
+
+def status_for_deadline(value: str) -> str:
+    deadline_at = parse_deadline_at(value)
+    if deadline_at is None:
+        return ""
+    formatted = format_deadline_at(deadline_at)
+    if deadline_at < now_kst():
+        return f"\ub9c8\uac10 ({formatted})"
+    return f"\uc811\uc218\uc911 (\ub9c8\uac10 {formatted})"
+
+
+def classify_application_status(text: str) -> str:
+    """Classify an application's current state without treating every '마감' as closed."""
+    compact = normalize_ws(text)
+    if not compact:
+        return ""
+
+    if re.search(r"\uc0c1\uc2dc\s*\ucc44\uc6a9|\uc218\uc2dc\s*\ucc44\uc6a9|\ucc44\uc6a9\s*\uc2dc\s*\ub9c8\uac10", compact, re.IGNORECASE):
+        return "\uc0c1\uc2dc\ucc44\uc6a9"
+    if re.search(r"\uc811\uc218\s*\ub9c8\uac10|\ubaa8\uc9d1\s*\ub9c8\uac10|\ucc44\uc6a9\s*\ub9c8\uac10|\ub9c8\uac10\s*\uc644\ub8cc|\ub9c8\uac10\ub428|\bclosed\b", compact, re.IGNORECASE):
+        return "\ub9c8\uac10"
+
+    dated_status = status_for_deadline(compact)
+    if dated_status:
+        return dated_status
+    if re.search(r"\uc624\ub298\s*\ub9c8\uac10", compact):
+        return "\uc811\uc218\uc911 (\uc624\ub298 \ub9c8\uac10)"
+    if re.search(r"D\s*-\s*\d+|D\s*day|\uc811\uc218\s*\uc911|\uc9c4\ud589\s*\uc911|\ubaa8\uc9d1\s*\uc911|\bopen\b", compact, re.IGNORECASE):
+        return "\uc811\uc218\uc911"
+    return ""
+
+
+def extract_deadline(text: str) -> str:
+    """Backward-compatible display value used by the Telegram report."""
+    return classify_application_status(text)
 
 
 def normalize_date_value(value: object) -> str:
@@ -1115,14 +1297,14 @@ def extract_deadline_from_json(value: object) -> str:
     for item in iter_json_values(value):
         for key in deadline_keys:
             if key in item:
-                normalized = normalize_date_value(item.get(key))
-                if normalized:
-                    return f"마감일 {normalized}"
+                status = status_for_deadline(str(item.get(key)))
+                if status:
+                    return status
         for key in status_keys:
             if key in item:
-                normalized = extract_deadline(str(item.get(key)))
-                if normalized:
-                    return normalized
+                status = classify_application_status(str(item.get(key)))
+                if status:
+                    return status
     return ""
 
 
@@ -1149,7 +1331,7 @@ def extract_deadline_from_html_data(raw_html: str) -> str:
     regex = rf"[\"']{key_pattern}[\"']\s*:\s*[\"']({date_pattern})[\"']"
     match = re.search(regex, raw_html, flags=re.IGNORECASE)
     if match:
-        return f"마감일 {match.group(2).replace('T', ' ')}"
+        return status_for_deadline(match.group(2).replace("T", " "))
 
     return ""
 
@@ -1173,17 +1355,37 @@ def extract_deadline_near_keyword(text: str, keyword: str) -> str:
 
 
 def enrich_hit(hit: JobHit) -> JobHit | None:
-    deadline = extract_deadline(" ".join([hit.title, hit.snippet]))
-    detail_failed = False
+    listing_status = extract_deadline(" ".join([hit.title, hit.snippet]))
+    detail_status = ""
+    detail_fetched = False
     detail_text = ""
     parsed = urllib.parse.urlparse(hit.url)
     if parsed.scheme in {"http", "https"}:
         try:
             html, _ = fetch_url(hit.url, timeout=12)
-            deadline = deadline or extract_deadline_from_html_data(html)
             detail_text = extract_job_detail_text(html)
+            detail_status = extract_deadline_from_html_data(html)
+            detail_fetched = True
         except Exception:
-            detail_failed = True
+            pass
+
+        needs_browser = browser_fallback_supported(hit.url) and (
+            not detail_fetched
+            or not detail_status
+            or (hit.category == "기술스택 후보" and not find_tech_stacks(detail_text))
+        )
+        if needs_browser:
+            try:
+                html, _ = fetch_url_with_browser(hit.url)
+                detail_text = extract_job_detail_text(html)
+                detail_status = (
+                    "\ub9c8\uac10 (\uacf5\uace0 \ud398\uc774\uc9c0 \uc5c6\uc74c)"
+                    if is_closed_job_page(html)
+                    else extract_deadline_from_html_data(html)
+                )
+                detail_fetched = True
+            except Exception:
+                pass
 
     if hit.category == "기술스택 후보":
         stacks = find_tech_stacks(detail_text)
@@ -1202,11 +1404,13 @@ def enrich_hit(hit: JobHit) -> JobHit | None:
             hit.match_basis = "공고명 기술스택"
 
     deadline_keyword = hit.tech_stacks[0] if hit.tech_stacks else hit.keyword
-    if detail_text:
-        deadline = deadline or extract_deadline_near_keyword(detail_text, deadline_keyword)
-    if deadline:
-        hit.deadline = deadline
-    elif detail_failed:
+    if detail_text and not detail_status:
+        detail_status = extract_deadline_near_keyword(detail_text, deadline_keyword)
+    if detail_status:
+        hit.deadline = detail_status
+    elif listing_status:
+        hit.deadline = listing_status
+    elif not detail_fetched:
         hit.deadline = "공식 목록 미표기 / 상세 확인 실패"
     else:
         hit.deadline = "공식 페이지 미표기"
@@ -1223,14 +1427,46 @@ def looks_like_page_job_context(text: str) -> bool:
     return any(keyword.lower() in lower for keyword in PAGE_JOB_CONTEXT_KEYWORDS)
 
 
+def discover_job_board_urls(source_url: str, links: list[dict[str, str]]) -> list[str]:
+    """Return a few same-site job-listing routes linked from a landing page."""
+    source_host = (urllib.parse.urlparse(source_url).hostname or "").lower()
+    discovered: list[str] = []
+    for link in links:
+        href = link["href"].strip()
+        if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        absolute_url = urllib.parse.urljoin(source_url, href)
+        parsed = urllib.parse.urlparse(absolute_url)
+        if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() != source_host:
+            continue
+        link_text = normalize_ws(link["text"]).lower()
+        path = parsed.path.lower()
+        is_listing_link = any(hint in link_text for hint in JOB_BOARD_LINK_TEXT_HINTS) or any(
+            hint in path for hint in JOB_BOARD_PATH_HINTS
+        )
+        if not is_listing_link or absolute_url == source_url or absolute_url in discovered:
+            continue
+        discovered.append(absolute_url)
+        if len(discovered) >= MAX_JOB_BOARD_LINKS_PER_PAGE:
+            break
+    return discovered
+
+
 def scan_company(company: dict[str, object]) -> tuple[list[JobHit], list[FetchStatus]]:
     hits: list[JobHit] = []
     statuses: list[FetchStatus] = []
     name = str(company["name"])
-    for url in company["urls"]:  # type: ignore[index]
-        source_url = str(url)
+    source_pages = [(str(url), 0) for url in company["urls"]]  # type: ignore[index]
+    queued_source_urls = {url for url, _ in source_pages}
+    visited_source_urls: set[str] = set()
+    discovered_job_board_pages = 0
+    while source_pages:
+        source_url, depth = source_pages.pop(0)
+        if source_url in visited_source_urls:
+            continue
+        visited_source_urls.add(source_url)
         try:
-            html, content_type = fetch_url(source_url)
+            html, content_type = fetch_source_url(source_url)
         except Exception as exc:
             statuses.append(FetchStatus(name, source_url, False, f"{type(exc).__name__}: {exc}"))
             continue
@@ -1239,6 +1475,15 @@ def scan_company(company: dict[str, object]) -> tuple[list[JobHit], list[FetchSt
         parser.feed(html)
         page_text = parser.text
         statuses.append(FetchStatus(name, source_url, True, content_type or "ok"))
+
+        if depth < MAX_JOB_BOARD_CRAWL_DEPTH and discovered_job_board_pages < MAX_DISCOVERED_JOB_BOARD_PAGES:
+            for listing_url in discover_job_board_urls(source_url, parser.links):
+                if listing_url not in queued_source_urls:
+                    source_pages.append((listing_url, depth + 1))
+                    queued_source_urls.add(listing_url)
+                    discovered_job_board_pages += 1
+                if discovered_job_board_pages >= MAX_DISCOVERED_JOB_BOARD_PAGES:
+                    break
 
         seen_on_page: set[tuple[str, str]] = set()
         for link in parser.links:
